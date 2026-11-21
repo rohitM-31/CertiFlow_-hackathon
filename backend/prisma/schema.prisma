@@ -1,0 +1,222 @@
+// CertiFlow data model.
+// Every rule that must NEVER be broken is enforced here by a database constraint,
+// not only in application code, so even buggy code or a race cannot violate it.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CENTRE
+  DISTRICT_OFFICER
+  QUALITY
+  STATE
+}
+
+// Life of a batch. See src/batches/workflow.ts for the allowed transitions.
+// There is no "draft": a batch only exists once a valid CSV was uploaded,
+// and it goes straight into review.
+enum BatchStatus {
+  DISTRICT_REVIEW
+  QUALITY_REVIEW
+  STATE_REVIEW
+  SENT_BACK // waiting for the centre to upload a corrected CSV
+  REJECTED // final
+  APPROVED // all approvals done; certificates being generated
+  ISSUED // every candidate has a certificate
+}
+
+enum Stage {
+  DISTRICT
+  QUALITY
+  STATE
+}
+
+enum DecisionType {
+  APPROVE
+  REJECT
+  SEND_BACK
+}
+
+enum CertificateStatus {
+  VALID
+  REVOKED
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED // gave up after all retries; visible to the state office
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+model District {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  centres Centre[]
+  users   User[]
+}
+
+model Centre {
+  id         String   @id @default(uuid())
+  code       String   @unique
+  name       String
+  districtId String
+  district   District @relation(fields: [districtId], references: [id])
+  users      User[]
+  batches    Batch[]
+}
+
+model User {
+  id           String     @id @default(uuid())
+  username     String     @unique
+  name         String
+  passwordHash String
+  role         Role
+  districtId   String? // district officers
+  district     District?  @relation(fields: [districtId], references: [id])
+  centreId     String? // training-centre users
+  centre       Centre?    @relation(fields: [centreId], references: [id])
+  decisions    Decision[]
+  createdAt    DateTime   @default(now())
+}
+
+model Batch {
+  id             String        @id @default(uuid())
+  number         Int           @unique @default(autoincrement()) // shown as "B-7"
+  courseName     String
+  sourceFile     String // name of the CSV the candidates came from
+  centreId       String
+  centre         Centre        @relation(fields: [centreId], references: [id])
+  status         BatchStatus   @default(DISTRICT_REVIEW)
+  // Incremented each time the batch is (re)submitted. Approvals are tied to a round,
+  // so approvals given before a send-back do not count after the corrected upload.
+  round          Int           @default(1)
+  stageEnteredAt DateTime      @default(now()) // when it reached the current reviewer (SLA clock)
+  escalatedAt    DateTime? // set once the SLA was breached at the current stage
+  lastReason     String? // reason given with the latest send-back / rejection
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  candidates     Candidate[]
+  decisions      Decision[]
+  certificates   Certificate[]
+
+  @@index([status, stageEnteredAt])
+}
+
+model Candidate {
+  id           String       @id @default(uuid())
+  batchId      String
+  batch        Batch        @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  // Programme-wide enrolment ID: one person's enrolment in one course.
+  enrollmentNo String
+  fullName     String
+  phone        String // 10-digit Indian mobile, used for WhatsApp
+  dateOfBirth  DateTime     @db.Date
+  certificate  Certificate?
+
+  @@unique([batchId, enrollmentNo])
+  @@index([enrollmentNo])
+}
+
+model Decision {
+  id        String       @id @default(uuid())
+  batchId   String
+  batch     Batch        @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  round     Int
+  stage     Stage
+  type      DecisionType
+  reason    String?
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  createdAt DateTime     @default(now())
+
+  // One vote per person per stage per round: double-clicks and replayed
+  // requests cannot count twice.
+  @@unique([batchId, round, stage, userId])
+}
+
+model Certificate {
+  id            String            @id @default(uuid())
+  number        String            @unique // PSM-XXXXXXXXXX, random (cannot be guessed)
+  candidateId   String            @unique // exactly one certificate per candidate row...
+  candidate     Candidate         @relation(fields: [candidateId], references: [id])
+  enrollmentNo  String            @unique // ...and per enrolment, ever
+  batchId       String
+  batch         Batch             @relation(fields: [batchId], references: [id])
+  status        CertificateStatus @default(VALID)
+  downloadToken String            @unique // secret in the candidate's download link
+  filePath      String? // set once the PDF (with QR code) has been rendered
+  issuedAt      DateTime          @default(now())
+  revokedAt     DateTime?
+  revokedById   String?
+  revokeReason  String?
+  delivery      Delivery?
+
+  @@index([batchId])
+}
+
+// WhatsApp delivery of one certificate. One row per certificate (UNIQUE), so a
+// candidate can never be messaged for the same certificate twice by our side;
+// the provider's idempotency key (= certificate id) covers retries after timeouts.
+model Delivery {
+  id                String         @id @default(uuid())
+  certificateId     String         @unique
+  certificate       Certificate    @relation(fields: [certificateId], references: [id])
+  phone             String
+  status            DeliveryStatus @default(PENDING)
+  attempts          Int            @default(0)
+  providerMessageId String?
+  lastError         String?
+  sentAt            DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+}
+
+// Background job queue stored in Postgres (see src/queue.ts). Jobs are inserted in
+// the SAME transaction as the change that causes them, so they can never be lost.
+model Job {
+  id          String    @id @default(uuid())
+  name        String // "issue-batch" | "render-pdf" | "send-whatsapp"
+  key         String    @unique // idempotency key: enqueueing the same work twice is a no-op
+  payload     Json
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(8)
+  runAt       DateTime  @default(now()) // not before this time (retry backoff)
+  lockedAt    DateTime? // when a worker claimed it; a stale lock means that worker died
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, runAt])
+}
+
+// Append-only record of every decision and system action (enforced by a DB trigger).
+model AuditLog {
+  id         String   @id @default(uuid())
+  entityType String // "batch" | "certificate"
+  entityId   String
+  batchId    String? // pulls a whole batch's story together, including its certificates
+  action     String
+  actorId    String? // null = system (worker / scheduler)
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([batchId, createdAt])
+}
